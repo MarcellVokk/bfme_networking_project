@@ -52,6 +52,8 @@ namespace relay
             TcpClient[] client = (TcpClient[])obj!;
             NetworkStream recv_stream = client[0].GetStream();
             NetworkStream send_stream = client[1].GetStream();
+            byte[] recv_buffer = new byte[5000];
+            int recv_buffer_size = 0;
             string address = "";
 
             Console.WriteLine("Client connected.");
@@ -60,41 +62,41 @@ namespace relay
             {
                 while (true)
                 {
-                    byte[] lengthBuffer = new byte[4];
-                    int bytesRead = recv_stream.Read(lengthBuffer, 0, lengthBuffer.Length);
+                    recv_buffer_size += recv_stream.Read(recv_buffer, recv_buffer_size, recv_buffer.Length - recv_buffer_size);
 
-                    if (bytesRead == 0)
-                        break;
-
-                    if (bytesRead < 4)
-                        throw new Exception("Failed to read the full message length.");
-
-                    int messageLength = BitConverter.ToInt32(lengthBuffer, 0);
-                    Console.WriteLine($"Message length: {messageLength} bytes");
-
-                    byte[] messageBuffer = new byte[messageLength];
-                    int totalBytesRead = 0;
-
-                    while (totalBytesRead < messageLength)
+                    if (recv_buffer_size >= 14)
                     {
-                        int currentBytesRead = recv_stream.Read(messageBuffer, totalBytesRead, messageLength - totalBytesRead);
-                        if (currentBytesRead == 0) throw new Exception("Client disconnected before the full message was received.");
-                        totalBytesRead += currentBytesRead;
-                    }
+                        byte[] source_address = recv_buffer[0..4];
+                        byte[] destination_address = recv_buffer[5..8];
+                        short port = BitConverter.ToInt16(recv_buffer, 8);
+                        int message_length = BitConverter.ToInt32(recv_buffer, 10);
 
-                    if (address == "")
-                    {
-                        address = Encoding.ASCII.GetString(messageBuffer);
-                        Console.WriteLine($"Address received: {address}");
+                        if (recv_buffer_size - 14 >= message_length)
+                        {
+                            if (address == "")
+                            {
+                                address = Encoding.ASCII.GetString(recv_buffer, 14, message_length);
+                                lock (clients)
+                                {
+                                    clients.Add(address, send_stream);
+                                }
 
-                        clients.Add(address, send_stream);
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Message received: {messageBuffer.Length} bytes");
+                                Console.WriteLine($"Address received: {address}");
+                            }
+                            else
+                            {
+                                lock (clients)
+                                {
+                                    foreach (var otherClient in clients.Values.Where(x => x != send_stream))
+                                        otherClient.Write(recv_buffer, 0, message_length + 14);
+                                }
 
-                        foreach (var otherClient in clients.Values.Where(x => x != send_stream))
-                            otherClient.Write(BitConverter.GetBytes(messageLength).Concat(messageBuffer).ToArray());
+                                Console.WriteLine($"Message received: {message_length} bytes");
+                            }
+
+                            recv_buffer_size -= message_length + 14;
+                            recv_buffer[(message_length + 14)..].CopyTo(recv_buffer, 0);
+                        }
                     }
                 }
             }
@@ -104,8 +106,11 @@ namespace relay
             }
             finally
             {
-                if (clients.ContainsKey(address))
-                    clients.Remove(address);
+                lock (clients)
+                {
+                    if (clients.ContainsKey(address))
+                        clients.Remove(address);
+                }
 
                 recv_stream.Close();
                 client[0].Close();

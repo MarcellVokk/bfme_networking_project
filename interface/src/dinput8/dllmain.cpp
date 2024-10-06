@@ -30,9 +30,11 @@ extern "C" __declspec(dllexport, naked) int DirectInput8Create()
 
 SOCKET cs_send = INVALID_SOCKET;
 SOCKET cs_recv = INVALID_SOCKET;
-char* buffer = new char[10000];
+char* buffer = new char[1200];
 int buffer_size = 0;
 std::mutex buffer_lock;
+char* my_address = new char[4];
+char* zeros = new char[10];
 
 typedef int (WINAPI* SENDTO)(SOCKET, const char*, int, int, const sockaddr*, int);
 SENDTO origSendTo = NULL;
@@ -42,31 +44,54 @@ RECVFROM origRecvFrom = NULL;
 
 int WINAPI detrSendTo(SOCKET s, const char* buf, int len, int flags, const sockaddr* to, int tolen)
 {
-	int messageLength = len;
-	if (send(cs_send, (char*)&messageLength, sizeof(int), 0) != SOCKET_ERROR)
-	{
-		if (send(cs_send, buf, len, 0) != SOCKET_ERROR)
-		{
-			return len;
-		}
-	}
+	if (to == NULL)
+		return SOCKET_ERROR;
 
-	return SOCKET_ERROR;
+	sockaddr_in* to_in = const_cast<sockaddr_in*>(reinterpret_cast<const sockaddr_in*>(to));
+	int message_length = len;
+
+	if (to_in->sin_port != 38431)
+		return message_length;
+
+	send(cs_send, my_address, 4, 0);
+	send(cs_send, (char*)&to_in->sin_addr, 4, 0);
+	send(cs_send, (char*)&to_in->sin_port, 2, 0);
+	send(cs_send, (char*)&message_length, 4, 0);
+	send(cs_send, buf, message_length, 0);
+
+	return message_length;
 }
 
 int WINAPI detrRecvFrom(SOCKET s, char* buf, int len, int flags, const sockaddr* from, int* fromlen)
 {
-	if (buffer_size > 0)
+	if (buffer_size >= 14)
 	{
 		buffer_lock.lock();
-		int messageLength = 0;
-		memcpy((char*)&messageLength, buffer, sizeof(int));
-		memcpy(buf, buffer + sizeof(int), messageLength);
-		buffer_size -= messageLength + sizeof(int);
-		memmove(buffer, buffer + messageLength + sizeof(int), buffer_size);
-		buffer_lock.unlock();
 
-		return messageLength;
+		int message_length = 0;
+		memcpy((char*)&message_length, buffer + 10, 4);
+
+		if (buffer_size >= message_length + 14)
+		{
+			if (from != NULL && fromlen != NULL)
+			{
+				struct sockaddr_in from_in;
+				from_in.sin_family = AF_INET;
+				memcpy(&from_in.sin_addr, buffer, 4);
+				memcpy(&from_in.sin_port, buffer + 8, 2);
+				memcpy((char*)from, &from_in, 8);
+				*fromlen = 8;
+			}
+
+			memcpy(buf, buffer + 14, message_length);
+			buffer_size -= message_length + 14;
+			memmove(buffer, buffer + message_length + 14, buffer_size);
+
+			buffer_lock.unlock();
+			return message_length;
+		}
+
+		buffer_lock.unlock();
 	}
 
 	WSASetLastError(WSAEWOULDBLOCK);
@@ -176,35 +201,51 @@ void StartRelay()
 		}
 	}
 
-	char hostname[256];
-	if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR)
+	// Get my ip
 	{
-		closesocket(cs_recv);
-		closesocket(cs_send);
-		WSACleanup();
-		return;
+		char hostname[256];
+		if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR)
+		{
+			closesocket(cs_recv);
+			closesocket(cs_send);
+			WSACleanup();
+			return;
+		}
+
+		struct addrinfo hints = { 0 };
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_flags = AI_PASSIVE;
+		struct addrinfo* addrResult = nullptr;
+		int result = getaddrinfo(hostname, nullptr, &hints, &addrResult);
+		if (result != 0)
+		{
+			closesocket(cs_recv);
+			closesocket(cs_send);
+			WSACleanup();
+			return;
+		}
+
+		const sockaddr_in* sa_in = reinterpret_cast<const sockaddr_in*>(addrResult->ai_addr);
+		memcpy(my_address, &sa_in->sin_addr, 4);
 	}
 
-	struct addrinfo hints = { 0 };
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
-	struct addrinfo* addrResult = nullptr;
-	int result = getaddrinfo(hostname, nullptr, &hints, &addrResult);
-	if (result != 0)
+	// Send hello to relay
 	{
-		closesocket(cs_recv);
-		closesocket(cs_send);
-		WSACleanup();
-		return;
+		char my_address_str[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, my_address, my_address_str, INET_ADDRSTRLEN);
+		int message_length = strlen(my_address_str);
+
+		send(cs_send, my_address, 4, 0);
+		send(cs_send, zeros, 6, 0);
+		send(cs_send, (char*)&message_length, 4, 0);
+		send(cs_send, my_address_str, message_length, 0);
 	}
 
-	std::string address = GetIp(addrResult->ai_addr);
-	int messageLength = address.length();
-	send(cs_send, (char*)&messageLength, sizeof(int), 0);
-	send(cs_send, address.c_str(), address.length(), 0);
-
-	CreateThread(0, 0, (LPTHREAD_START_ROUTINE)ReceiveThread, 0, 0, 0);
+	// Begin receive
+	{
+		CreateThread(0, 0, (LPTHREAD_START_ROUTINE)ReceiveThread, 0, 0, 0);
+	}
 }
 
 void ReceiveThread()
@@ -224,40 +265,32 @@ void ReceiveThread()
 
 bool ReceiveMessage()
 {
-	int messageLength = 0;
-	int bytesReceived = recv(cs_recv, (char*)&messageLength, sizeof(int), 0);
-
-	if (bytesReceived <= 0)
-		return false;
-
-	char* messageBuffer = new char[messageLength];
-	int totalBytesReceived = 0;
-	while (totalBytesReceived < messageLength)
+	buffer_lock.lock();
+	while (buffer_size > 850)
 	{
-		int remainingBytes = messageLength - totalBytesReceived;
-		bytesReceived = recv(cs_recv, messageBuffer + totalBytesReceived, remainingBytes, 0);
-		if (bytesReceived <= 0)
-		{
-			delete[] messageBuffer;
-			return false;
-		}
+		int message_length = 0;
+		memcpy((char*)&message_length, buffer + 10, 4);
 
-		totalBytesReceived += bytesReceived;
+		buffer_size -= message_length + 14;
+		memmove(buffer, buffer + message_length + 14, buffer_size);
 	}
+	buffer_lock.unlock();
 
-	if (buffer_size + messageLength <= 9000)
+	char* recv_buffer = new char[300];
+	int bytes_received = recv(cs_recv, recv_buffer, 300, 0);
+	
+	if (bytes_received > 0)
 	{
-		// Process message
 		buffer_lock.lock();
-		memcpy(buffer + buffer_size, (char*)&messageLength, sizeof(int));
-		buffer_size += sizeof(int);
-		memcpy(buffer + buffer_size, messageBuffer, messageLength);
-		buffer_size += messageLength;
+		memcpy(buffer + buffer_size, recv_buffer, bytes_received);
+		buffer_size += bytes_received;
 		buffer_lock.unlock();
+		delete[] recv_buffer;
+		return true;
 	}
 
-	delete[] messageBuffer;
-	return true;
+	delete[] recv_buffer;
+	return false;
 }
 
 void ModifyIp(const sockaddr* addr, const char* new_ip)
